@@ -29,7 +29,7 @@ demo = "src.demo:main"
 client-a2a = "src.client_a2a:main"
 web = "src.web:main"
 web-agentcore = "src.web_agentcore:main"
-agent-langgraph = "src.agent_langgraph:main"
+agent-langgraph = "src.server_langgraph:main"
 
 [build-system]
 requires = ["poetry-core"]

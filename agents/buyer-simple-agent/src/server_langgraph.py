@@ -6,7 +6,7 @@ the LangGraph ReAct agent orchestrates buyer tools (discover, check balance,
 purchase) autonomously.
 
 Usage:
-    poetry run python -m src.agent_langgraph
+    poetry run python -m src.server_langgraph
 """
 
 import os
