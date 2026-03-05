@@ -9,7 +9,6 @@ Usage:
     from src.langgraph_agent import payments, create_agent, NVM_PLAN_ID
 """
 
-import json
 import os
 
 from dotenv import load_dotenv
@@ -21,7 +20,6 @@ from langgraph.prebuilt import create_react_agent
 from payments_py import Payments, PaymentOptions
 from payments_py.x402.langchain import requires_payment
 
-from .pricing import PRICING_TIERS
 from .tools.market_research import research_market_impl
 from .tools.summarize import summarize_content_impl
 from .tools.web_search import search_web

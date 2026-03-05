@@ -95,9 +95,6 @@ mcp = PaymentsMCP(
     description="Paid search and analysis tools",
 )
 ```
-
-> "Two boilerplate lines at the top: `load_dotenv()` loads your `.env` file, and `urllib3.disable_warnings()` silences SSL warnings in sandbox. Then `Payments.get_instance()` — note it's a class method, not a constructor — gives you the SDK instance."
-
 > "The server name is important — it becomes part of the logical URI: `mcp://my-mcp-server/tools/search`. Same registration works on localhost or production."
 
 #### Step 2: Add a tool (fixed credits)
@@ -228,8 +225,6 @@ print("Content:", result.get("result", {}).get("content"))    # Tool output
 print("Payment:", result.get("result", {}).get("_meta"))       # Settlement receipt
 ```
 
-> "A few things to call out: we use `httpx.Client(timeout=60.0)` — the default 5-second timeout is too short for payment verification. The `Accept` header includes both `application/json` and `text/event-stream` because MCP streamable HTTP may respond with either. And the response includes your tool output plus a `_meta` field with payment metadata."
-
 **Run it:**
 ```bash
 # Terminal 1: server is already running
@@ -251,11 +246,11 @@ python client.py
 
 > "We already saw the `price_by_length` function. The key insight: the callable runs AFTER the tool executes. So you charge based on actual output, not estimated output."
 
-**Observability (mention, don't demo unless time permits):**
+**Observability:**
 
 > "If your tool calls an LLM, add a `paywall_context` parameter. The framework injects subscriber identity and request metadata. Use `StartAgentRequest` + `payments.observability.with_openai()` to get a proxied OpenAI client that tags every LLM call with the subscriber. Your Helicone dashboard shows exactly which subscriber caused which LLM costs."
 
-**Connecting AI Assistants (quick mention):**
+**Connecting AI Assistants:**
 
 > "Once your server runs, Claude Code and Cursor can connect directly. Add your `/mcp` endpoint to the MCP settings. The AI assistant auto-discovers tools via `tools/list` and uses them with payment tokens."
 
@@ -276,20 +271,7 @@ python client.py
 | `PaymentsMCP` import fails | Check `payments-py` is up to date: `pip install -U payments-py` |
 | `Payments()` constructor error | Use `Payments.get_instance(PaymentOptions(...))` — not `Payments(...)` directly |
 | `mcp.start()` fails | Check port 3000 is free; check `NVM_AGENT_ID` is set |
-| Client gets 401/403 | Token must be sent as `Authorization: Bearer <token>`, not `payment-signature`. Also verify client uses `NVM_SUBSCRIBER_API_KEY` (subscriber key), not the builder `NVM_API_KEY` |
-| Client timeout / connection error | Use `httpx.Client(timeout=60.0)` — the default 5s timeout is too short for payment verification round-trips |
 | Client gets empty or unexpected response | Add `Accept: application/json, text/event-stream` header — MCP streamable HTTP requires it |
-| `.env` not loading | Add `from dotenv import load_dotenv` and call `load_dotenv()` at the top of every file |
-| SSL warnings flooding console | Add `urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)` at the top |
 | Dynamic pricing returns wrong amount | Check the context dict structure: `context.get("output")` vs `context.get("result")` — depends on version |
 | TypeScript `registerTool` type errors | Use `as any` for inputSchema if zod types don't match |
 | `_meta` field missing in response | Check server is using PaymentsMCP (not plain MCP) |
-
----
-
-## Backup Plan
-
-If the MCP server won't start:
-1. **Walk through the code** — explain each decorator/registration call
-2. **Use curl to simulate** — send JSON-RPC to a pre-running server
-3. **Show the Agent Card from `agents/mcp-server-agent/`** — a more complete reference implementation
