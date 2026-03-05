@@ -409,6 +409,73 @@ Combine credit burns and mints for a wallet:
 }
 ```
 
+### Identifying Fiat/Stripe Payments
+
+Stripe (fiat) payments and crypto payments both create on-chain agreements, but they follow different patterns:
+
+- **Fiat/Stripe purchases** go through `FiatPaymentTemplate` and create agreements with **3 conditions**: FiatSettlementCondition + DistributePaymentsCondition + TransferCreditsCondition
+- **Crypto (USDC) purchases** go through `FixedPaymentTemplate` and create agreements with **2 conditions**: LockPaymentCondition + TransferCreditsCondition
+
+You can use this to filter fiat vs crypto purchases:
+
+**Fiat/Stripe agreements (3 conditions):**
+
+```graphql
+{
+  agreements(
+    orderBy: blockTimestamp
+    orderDirection: desc
+    first: 20
+  ) {
+    id
+    creator
+    blockTimestamp
+    transactionHash
+    conditions {
+      conditionId
+      state
+    }
+  }
+}
+```
+
+Then filter client-side: agreements with `conditions.length == 3` are fiat/Stripe, those with `conditions.length == 2` are crypto.
+
+**Combined view — fiat purchases with their associated credit mints:**
+
+Since the agreement and the credit mint happen in the same transaction, you can join them by `transactionHash`:
+
+```graphql
+{
+  fiatAgreements: agreements(
+    orderBy: blockTimestamp
+    orderDirection: desc
+    first: 10
+  ) {
+    id
+    creator
+    blockTimestamp
+    transactionHash
+    conditions { state }
+  }
+  creditMints: creditTransfers(
+    where: { type: "mint" }
+    orderBy: blockTimestamp
+    orderDirection: desc
+    first: 50
+  ) {
+    to
+    planId
+    amount
+    transactionHash
+  }
+}
+```
+
+Match entries where `fiatAgreements[].transactionHash == creditMints[].transactionHash` and the agreement has 3 conditions — those are Stripe-funded credit purchases.
+
+> **Note:** The Stripe charge itself is off-chain and not visible in the subgraph. What you see on-chain is the settlement: the agreement registration, condition fulfillment, and credit minting that happens after the Stripe charge succeeds.
+
 ### Pagination
 
 Use `skip` and `first` for paginated results:
