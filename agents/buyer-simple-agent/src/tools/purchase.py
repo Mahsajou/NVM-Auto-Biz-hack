@@ -32,10 +32,11 @@ def purchase_data_impl(
     seller_url: str,
     query: str,
     agent_id: str | None = None,
+    path: str = "/data",
 ) -> dict:
     """Purchase data from a seller using the x402 protocol.
 
-    Generates an x402 access token, POSTs the query to {seller_url}/data
+    Generates an x402 access token, POSTs the query to {seller_url}{path}
     with the payment-signature header, and handles the response.
     The seller's verify/settle flow handles plan ordering on behalf of the
     buyer if they are not yet subscribed.
@@ -46,10 +47,16 @@ def purchase_data_impl(
         seller_url: Base URL of the seller.
         query: The data query to send.
         agent_id: Optional seller agent ID for token scoping.
+        path: Endpoint path (default /data). Use /ask for agents that use that path.
 
     Returns:
         dict with status, content (for Strands), response data, and credits_used.
     """
+    base = seller_url.rstrip("/")
+    endpoint = (
+        f"{base}{path}" if path.startswith("/") else
+        (f"{base}/{path}" if path else base)
+    )
     try:
         token_options = build_token_options(payments, plan_id)
 
@@ -68,7 +75,7 @@ def purchase_data_impl(
 
         with httpx.Client(timeout=60.0) as client:
             response = client.post(
-                f"{seller_url}/data",
+                endpoint,
                 headers={
                     "Content-Type": "application/json",
                     "payment-signature": access_token,
@@ -91,8 +98,9 @@ def purchase_data_impl(
 
         if response.status_code != 200:
             return _error(
-                f"Seller returned HTTP {response.status_code}: "
-                f"{response.text[:500]}"
+                f"Seller returned HTTP {response.status_code} from {endpoint}. "
+                f"Try PROMPTA_ENDPOINT_PATH=/ask if the agent uses /ask. "
+                f"Response: {response.text[:300]}"
             )
 
         data = response.json()
@@ -107,6 +115,6 @@ def purchase_data_impl(
         }
 
     except httpx.ConnectError:
-        return _error(f"Cannot connect to seller at {seller_url}. Is it running?")
+        return _error(f"Cannot connect to seller at {endpoint}. Is the URL correct?")
     except Exception as e:
         return _error(f"Purchase failed: {e}")

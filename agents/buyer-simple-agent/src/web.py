@@ -17,6 +17,7 @@ import asyncio
 import json
 import os
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,9 +28,7 @@ load_dotenv()
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 from sse_starlette.sse import EventSourceResponse
-from starlette.responses import FileResponse
 
 from strands.models.openai import OpenAIModel
 
@@ -47,6 +46,22 @@ from .strands_agent import (
 from .tools.balance import check_balance_impl
 from .grocery_parser import parse_grocery_list, GroceryItem
 from .tools.purchase import purchase_data_impl
+from .prompta_leads import get_leads
+from .reviews_seller import get_reviews
+
+try:
+    from . import platon_memory
+    _PLATON_AVAILABLE = True
+except ImportError as e:
+    _PLATON_AVAILABLE = False
+    _PLATON_IMPORT_ERROR = str(e)
+
+try:
+    from .apify_checker import check_amazon_availability
+    _APIFY_AVAILABLE = True
+except ImportError as e:
+    _APIFY_AVAILABLE = False
+    _APIFY_IMPORT_ERROR = str(e)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 BUYER_PORT = int(os.getenv("BUYER_PORT", "8000"))
@@ -102,7 +117,7 @@ async def _start_log_dispatcher():
 # CORS for frontend dev server
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:8000", "http://127.0.0.1:8000"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -176,12 +191,21 @@ async def get_sellers():
 
 @app.get("/api/balance")
 async def get_balance():
-    """Check credit balance and budget status."""
+    """Check credit balance and budget status. Tracks API calls to sellers and services."""
     balance_result = check_balance_impl(payments, NVM_PLAN_ID)
     budget_status = budget.get_status()
+    # Optionally include Trust Net (USDC) balance
+    trustnet_balance = None
+    if _TRUST_NET_AVAILABLE:
+        try:
+            trustnet_result = check_balance_impl(payments, trust_net.TRUST_NET_USDC_PLAN_ID)
+            trustnet_balance = trustnet_result.get("balance", 0)
+        except Exception:
+            pass
     return JSONResponse(content={
         "balance": balance_result,
         "budget": budget_status,
+        "trustnet_balance": trustnet_balance,
     })
 
 
@@ -223,6 +247,7 @@ async def log_stream(request: Request):
 
 _grocery_session: dict = {"active": False, "items": [], "results": []}
 _grocery_reviews: list[dict] = []
+_context_saves: list[dict] = []  # Platon dump_session successes for Context Tool tab
 
 
 def _get_seller_name_and_url() -> tuple[str, str]:
@@ -293,9 +318,29 @@ async def grocery_shop(request: Request):
     log(_logger, "GROCERY", "SHOP", f"starting shop for {len(items)} items")
     _grocery_session.update(active=True, items=raw_items, results=[])
 
+    session_id = f"session-{datetime.now(timezone.utc).strftime('%Y-%m-%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    item_names = [it.to_query() for it in items]
+
+    # Platon: retrieve context before task (optional; continue if unavailable)
+    if _PLATON_AVAILABLE:
+        try:
+            ctx = await asyncio.to_thread(
+                platon_memory.retrieve_context,
+                f"Grocery shopping: {len(items)} items — {', '.join(item_names[:5])}{'...' if len(item_names) > 5 else ''}",
+                limit=5,
+                payments=payments,
+            )
+            if ctx.get("error"):
+                log(_logger, "PLATON", "RETRIEVE", ctx["error"])
+            else:
+                log(_logger, "PLATON", "RETRIEVE", "context loaded")
+        except Exception as e:
+            log(_logger, "PLATON", "RETRIEVE", str(e))
+
     async def event_generator():
         total_credits = 0
         purchased, skipped, failed = 0, 0, 0
+        errors: list[str] = []
 
         for idx, item in enumerate(items):
             yield {
@@ -343,6 +388,7 @@ async def grocery_shop(request: Request):
                 error_text = ""
                 if result.get("content"):
                     error_text = result["content"][0]["text"][:200]
+                errors.append(f"{item.name}: {error_text}")
                 entry = {
                     "item": item.to_dict(),
                     "status": "failed",
@@ -357,19 +403,59 @@ async def grocery_shop(request: Request):
 
         _grocery_session["active"] = False
         seller_name, seller_url = _get_seller_name_and_url()
+        done_payload = {
+            "purchased": purchased,
+            "skipped": skipped,
+            "failed": failed,
+            "total_credits": total_credits,
+            "budget": budget.get_status(),
+            "seller_name": seller_name,
+            "seller_url": seller_url,
+            "results": _grocery_session["results"],
+        }
         yield {
             "event": "shopping_done",
-            "data": json.dumps({
-                "purchased": purchased,
-                "skipped": skipped,
-                "failed": failed,
-                "total_credits": total_credits,
-                "budget": budget.get_status(),
-                "seller_name": seller_name,
-                "seller_url": seller_url,
-                "results": _grocery_session["results"],
-            }),
+            "data": json.dumps(done_payload),
         }
+
+        # Platon: dump session after task (always, including failed/partial)
+        if _PLATON_AVAILABLE:
+            try:
+                outcome_status = "success" if failed == 0 else ("partial" if purchased > 0 else "failed")
+                dump_result = await asyncio.to_thread(
+                    platon_memory.dump_session,
+                    session_id=session_id,
+                    task={
+                        "kind": "grocery-shopping",
+                        "summary": f"Shop {len(items)} items: {', '.join(item_names[:5])}{'...' if len(item_names) > 5 else ''}",
+                    },
+                    outcome={
+                        "status": outcome_status,
+                        "summary": f"Purchased {purchased}, skipped {skipped}, failed {failed}. Total credits: {total_credits}.",
+                    },
+                    tools=["purchase_data_impl", "budget"],
+                    events=[{"type": "shopping_done", "purchased": purchased, "failed": failed}],
+                    errors=errors if errors else None,
+                    artifacts=[{"kind": "results", "summary": f"{purchased} purchased, {failed} failed"}],
+                    payments=payments,
+                )
+                if dump_result.get("status") == "saved":
+                    entry = {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "session_id": session_id,
+                        "task": "grocery-shopping",
+                        "outcome": outcome_status,
+                    }
+                    _context_saves.append(entry)
+                    log(_logger, "PLATON", "DUMP", f"context saved: {session_id}")
+                    yield {
+                        "event": "context_saved",
+                        "data": json.dumps(entry),
+                    }
+                else:
+                    log(_logger, "PLATON", "DUMP", dump_result.get("error", "unknown"))
+            except Exception as e:
+                log(_logger, "PLATON", "DUMP", str(e))
 
     return EventSourceResponse(event_generator())
 
@@ -416,6 +502,190 @@ async def grocery_reviews():
 
 
 # ---------------------------------------------------------------------------
+# Prompta — lead generation (find customers with grocery shopping needs)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/leads/get")
+async def leads_get():
+    """Fetch leads from Prompta marketing agent — users with grocery shopping needs."""
+    log(_logger, "LEADS", "FETCH", "calling Prompta agent")
+    result = await asyncio.to_thread(get_leads, payments)
+    return JSONResponse(result)
+
+
+# ---------------------------------------------------------------------------
+# Shop Mate Seller Reviews — purchase review data from reviews seller agent
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/reviews/purchase")
+async def reviews_purchase(request: Request):
+    """Purchase reviews from the Shop Mate Seller Reviews agent."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    query = (body.get("query") or "").strip()
+    log(_logger, "REVIEWS", "PURCHASE", f"calling reviews seller (query={query[:50] if query else 'default'}...)")
+    result = await asyncio.to_thread(get_reviews, payments, query)
+    return JSONResponse(result)
+
+
+# ---------------------------------------------------------------------------
+# Platon — persistent context (memory.retrieve_context, memory.dump_session)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/platon/context-saves")
+async def platon_context_saves():
+    """Return recent Platon context save events (Context Tool tab)."""
+    return JSONResponse({"saves": _context_saves})
+
+
+# ---------------------------------------------------------------------------
+# Apify ecommerce availability check ("Check if Amazon carry it")
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/grocery/check-availability")
+async def check_availability(request: Request):
+    """Check if items from a shopping list are carried by Amazon.
+
+    Accepts {"items": ["item1", "item2", ...]} — product names to search.
+    Returns availability results per item. Does NOT make purchases.
+    """
+    if not _APIFY_AVAILABLE:
+        return JSONResponse(
+            {"error": f"Apify not available: {_APIFY_IMPORT_ERROR}. Run: poetry add apify-client"},
+            status_code=503,
+        )
+
+    body = await request.json()
+    raw_items = body.get("items", [])
+    if not raw_items:
+        return JSONResponse({"error": "No items to check"}, status_code=400)
+
+    # Support both string list and object list (e.g. from GroceryItem)
+    item_names = []
+    for it in raw_items:
+        if isinstance(it, str):
+            item_names.append(it)
+        elif isinstance(it, dict):
+            item_names.append(it.get("name", it.get("raw_line", str(it))))
+        else:
+            item_names.append(str(it))
+
+    log(_logger, "APIFY", "CHECK", f"checking {len(item_names)} items on Amazon")
+    results = await asyncio.to_thread(
+        check_amazon_availability,
+        items=item_names,
+        api_key=os.getenv("APIFY_API_KEY"),
+        max_items_per_search=5,
+    )
+
+    return JSONResponse({
+        "results": [
+            {
+                "item_name": r.item_name,
+                "found": r.found,
+                "store": r.store,
+                "product_count": r.product_count,
+                "top_match": r.top_match,
+                "error": r.error,
+                "products": [
+                    {
+                        "image": p.image,
+                        "url": p.url,
+                        "name": p.name,
+                        "price": p.price,
+                        "price_currency": p.price_currency,
+                        "brand": p.brand,
+                        "rating": p.rating,
+                        "review_count": p.review_count,
+                        "store": p.store,
+                    }
+                    for p in r.products
+                ],
+            }
+            for r in results
+        ],
+    })
+
+
+# ---------------------------------------------------------------------------
+# Trust Net — rank and verify sellers (x402 + USDC)
+# ---------------------------------------------------------------------------
+
+try:
+    from . import trust_net
+    _TRUST_NET_AVAILABLE = True
+except ImportError as e:
+    _TRUST_NET_AVAILABLE = False
+    _TRUST_NET_IMPORT_ERROR = str(e)
+
+
+@app.get("/api/trustnet/agents")
+async def trustnet_list_agents():
+    """List vetted agents from Trust Net (trust score, reviews, verified status)."""
+    if not _TRUST_NET_AVAILABLE:
+        return JSONResponse(
+            {"error": f"Trust Net not available: {_TRUST_NET_IMPORT_ERROR}"},
+            status_code=503,
+        )
+    result = await asyncio.to_thread(trust_net.list_agents)
+    return JSONResponse(result)
+
+
+@app.get("/api/trustnet/reviews")
+async def trustnet_get_reviews(agent_id: str = ""):
+    """Get community reviews for an agent. Query param: agent_id."""
+    if not _TRUST_NET_AVAILABLE:
+        return JSONResponse(
+            {"error": f"Trust Net not available: {_TRUST_NET_IMPORT_ERROR}"},
+            status_code=503,
+        )
+    if not agent_id:
+        return JSONResponse({"error": "agent_id query param required"}, status_code=400)
+    result = await asyncio.to_thread(trust_net.get_reviews, agent_id)
+    return JSONResponse(result)
+
+
+@app.post("/api/trustnet/review")
+async def trustnet_submit_review(request: Request):
+    """Submit a review for an agent (requires verification tx)."""
+    if not _TRUST_NET_AVAILABLE:
+        return JSONResponse(
+            {"error": f"Trust Net not available: {_TRUST_NET_IMPORT_ERROR}"},
+            status_code=503,
+        )
+    body = await request.json()
+    agent_id = body.get("agent_id", "")
+    reviewer_address = body.get("reviewer_address", "")
+    verification_tx = body.get("verification_tx", "")
+    score = int(body.get("score", 0))
+    comment = body.get("comment", "")
+
+    if not all([agent_id, reviewer_address, verification_tx, comment]):
+        return JSONResponse(
+            {"error": "agent_id, reviewer_address, verification_tx, comment required"},
+            status_code=400,
+        )
+    if not (1 <= score <= 10):
+        return JSONResponse({"error": "score must be 1-10"}, status_code=400)
+
+    result = await asyncio.to_thread(
+        trust_net.submit_review,
+        agent_id,
+        reviewer_address,
+        verification_tx,
+        score,
+        comment,
+    )
+    return JSONResponse(result)
+
+
+# ---------------------------------------------------------------------------
 # A2A registration routes
 # ---------------------------------------------------------------------------
 
@@ -437,36 +707,25 @@ a2a_app = A2AFastAPIApplication(
 )
 a2a_app.add_routes_to_app(app)
 
-# ---------------------------------------------------------------------------
-# Static file serving (production frontend)
-# ---------------------------------------------------------------------------
 
-FRONTEND_DIR = Path(__file__).parent.parent / "frontend" / "dist"
-
-
-if FRONTEND_DIR.exists():
-    app.mount("/assets", StaticFiles(directory=FRONTEND_DIR / "assets"), name="assets")
-
-    @app.get("/{path:path}")
-    async def spa_fallback(path: str):
-        """Serve the SPA index.html for all non-API routes."""
-        file_path = (FRONTEND_DIR / path).resolve()
-        if file_path.is_relative_to(FRONTEND_DIR.resolve()) and file_path.is_file():
-            return FileResponse(file_path)
-        return FileResponse(FRONTEND_DIR / "index.html")
+@app.get("/")
+async def root():
+    """API only — no UI. Use http://localhost:5173 for the frontend."""
+    return JSONResponse({
+        "message": "API server. Use http://localhost:5173 for the UI.",
+        "docs": "/api/sellers, /api/chat, /api/grocery/*, /api/trustnet/*",
+    })
 
 
 def main():
-    """Run the buyer agent web server."""
+    """Run the buyer agent API server (no UI). Use localhost:5173 for the frontend."""
     import uvicorn
 
     log(_logger, "WEB", "STARTUP", f"port={BUYER_PORT} mode=a2a")
-    print(f"Buyer Agent Web Server running on http://localhost:{BUYER_PORT}")
+    print(f"API server running on http://localhost:{BUYER_PORT}")
+    print(f"  API: /api/chat, /api/sellers, /api/grocery/*, /api/trustnet/*")
     print(f"A2A registration endpoint active")
-    if FRONTEND_DIR.exists():
-        print(f"Serving frontend from {FRONTEND_DIR}")
-    else:
-        print(f"Frontend not built — use http://localhost:5173 for dev")
+    print(f"  Frontend: http://localhost:5173 (run: cd frontend && npm run dev)")
 
     uvicorn.run(app, host="0.0.0.0", port=BUYER_PORT, log_level="warning")
 

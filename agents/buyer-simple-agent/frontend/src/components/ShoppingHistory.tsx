@@ -12,6 +12,7 @@ import {
 interface ShoppingHistoryProps {
   entries: HistoryEntry[];
   onEntriesChange: (entries: HistoryEntry[]) => void;
+  onRatingChange?: (entryId: string, rating: number | null) => void;
   fullHeight?: boolean;
 }
 
@@ -33,6 +34,7 @@ function formatDate(iso: string): string {
 export default function ShoppingHistory({
   entries,
   onEntriesChange,
+  onRatingChange,
   fullHeight = false,
 }: ShoppingHistoryProps) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -40,16 +42,12 @@ export default function ShoppingHistory({
 
   const handleInlineRate = async (entry: HistoryEntry, rating: number) => {
     if (entry.rating != null) return;
+    onRatingChange?.(entry.id, rating);
     setSubmitting(entry.id);
     try {
       await submitReview(entry.sellerUrl, entry.sellerName, rating, "");
-      const updated = entries.map((e) =>
-        e.id === entry.id ? { ...e, rating } : e,
-      );
-      onEntriesChange(updated);
-      saveHistory(updated);
     } catch {
-      // silently fail
+      onRatingChange?.(entry.id, null);
     } finally {
       setSubmitting(null);
     }
@@ -92,27 +90,44 @@ export default function ShoppingHistory({
                   key={entry.id}
                   className="rounded-lg border bg-card text-card-foreground overflow-hidden"
                 >
-                  <button
-                    type="button"
-                    onClick={() => setExpandedId(isExpanded ? null : entry.id)}
-                    className="w-full flex items-center gap-2 px-3 py-2.5 text-left hover:bg-muted/50 transition-colors"
-                  >
-                    {isExpanded ? (
-                      <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
-                    ) : (
-                      <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
-                    )}
+                  <div className="flex items-center gap-2 px-3 py-2.5">
+                    <button
+                      type="button"
+                      onClick={() => setExpandedId(isExpanded ? null : entry.id)}
+                      className="flex items-center gap-2 text-left hover:bg-muted/50 rounded transition-colors -m-1 p-1 shrink-0"
+                    >
+                      {isExpanded ? (
+                        <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
+                      ) : (
+                        <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
+                      )}
+                    </button>
                     <Store className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                    <span className="flex-1 truncate text-sm font-medium">
+                    <span className="truncate text-sm font-medium min-w-0">
                       {entry.sellerName}
                     </span>
+                    <div
+                      className="shrink-0"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <StarRating
+                        value={entry.rating ?? 0}
+                        onChange={(r) => handleInlineRate(entry, r)}
+                        readonly={entry.rating != null}
+                        size="sm"
+                      />
+                    </div>
+                    {submitting === entry.id && (
+                      <span className="text-xs text-muted-foreground shrink-0">Saving...</span>
+                    )}
+                    <span className="flex-1" />
                     <span className="text-xs text-muted-foreground shrink-0">
                       {formatDate(entry.timestamp)}
                     </span>
                     <span className="text-xs text-[var(--color-nvm-teal)] shrink-0">
                       {entry.summary.total_credits} cr
                     </span>
-                  </button>
+                  </div>
 
                   {isExpanded && (
                     <div className="border-t px-3 py-2 space-y-3 text-sm">
@@ -136,22 +151,13 @@ export default function ShoppingHistory({
                         ))}
                       </ul>
 
-                      <div className="pt-2 border-t flex items-center gap-2">
-                        <StarRating
-                          value={entry.rating ?? 0}
-                          onChange={(r) => handleInlineRate(entry, r)}
-                          readonly={entry.rating != null}
-                          size="sm"
-                        />
-                        {submitting === entry.id && (
-                          <span className="text-xs text-muted-foreground">Saving...</span>
-                        )}
-                        {entry.review && (
+                      {entry.review && (
+                        <div className="pt-2 border-t">
                           <p className="text-muted-foreground text-xs italic">
                             {entry.review}
                           </p>
-                        )}
-                      </div>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>

@@ -23,12 +23,22 @@ export interface ChatMessage {
 export async function fetchSellers(): Promise<Seller[]> {
   const res = await fetch("/api/sellers");
   if (!res.ok) return [];
-  return res.json();
+  const data = await res.json();
+  if (!Array.isArray(data)) return [];
+  return data.map((s: Record<string, unknown>) => ({
+    url: String(s?.url ?? ""),
+    name: typeof s?.name === "string" ? s.name : (Array.isArray(s?.name) ? s.name.join(", ") : String(s?.name ?? "Unknown")),
+    description: typeof s?.description === "string" ? s.description : "",
+    skills: Array.isArray(s?.skills) ? s.skills.map((sk: unknown) => typeof sk === "string" ? sk : (sk && typeof sk === "object" && "name" in (sk as object) ? String((sk as { name?: unknown }).name) : String(sk))) : [],
+    credits: typeof s?.credits === "number" ? s.credits : 1,
+    cost_description: typeof s?.cost_description === "string" ? s.cost_description : "",
+  }));
 }
 
 export async function fetchBalance(): Promise<{
   balance: Record<string, unknown>;
   budget: Record<string, unknown>;
+  trustnet_balance?: number;
 } | null> {
   try {
     const res = await fetch("/api/balance");
@@ -138,6 +148,13 @@ export interface HistoryEntry {
   review: string;
 }
 
+export interface ContextSaveEvent {
+  timestamp: string;
+  session_id: string;
+  task: string;
+  outcome: string;
+}
+
 export interface ShopCallbacks {
   onItemStart: (index: number, total: number, item: GroceryItem) => void;
   onItemDone: (index: number, item: GroceryItem, status: string, credits?: number, error?: string) => void;
@@ -156,6 +173,7 @@ export interface ShopCallbacks {
     }>;
   }) => void;
   onError: (message: string) => void;
+  onContextSaved?: (save: ContextSaveEvent) => void;
 }
 
 export async function parseGroceryText(text: string): Promise<GroceryItem[]> {
@@ -238,6 +256,9 @@ export async function shopGroceryList(
             case "shopping_done":
               callbacks.onDone(data);
               break;
+            case "context_saved":
+              callbacks.onContextSaved?.(data);
+              break;
           }
         } catch {
           // skip malformed JSON
@@ -248,6 +269,60 @@ export async function shopGroceryList(
 }
 
 const HISTORY_STORAGE_KEY = "grocery_history";
+const USER_PROFILE_KEY = "shopmate_user_profile";
+const USER_BUDGET_KEY = "shopmate_user_budget";
+
+export interface UserProfile {
+  name: string;
+  email: string;
+  tel: string;
+  address: string;
+}
+
+export const DEFAULT_PROFILE: UserProfile = {
+  name: "",
+  email: "",
+  tel: "",
+  address: "",
+};
+
+export function loadProfile(): UserProfile {
+  try {
+    const raw = localStorage.getItem(USER_PROFILE_KEY);
+    if (!raw) return { ...DEFAULT_PROFILE };
+    const parsed = JSON.parse(raw);
+    return { ...DEFAULT_PROFILE, ...parsed };
+  } catch {
+    return { ...DEFAULT_PROFILE };
+  }
+}
+
+export function saveProfile(profile: UserProfile): void {
+  try {
+    localStorage.setItem(USER_PROFILE_KEY, JSON.stringify(profile));
+  } catch {
+    // ignore
+  }
+}
+
+export function loadBudget(): number {
+  try {
+    const raw = localStorage.getItem(USER_BUDGET_KEY);
+    if (raw == null) return 100;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : 100;
+  } catch {
+    return 100;
+  }
+}
+
+export function saveBudget(budget: number): void {
+  try {
+    localStorage.setItem(USER_BUDGET_KEY, String(Math.max(0, budget)));
+  } catch {
+    // ignore
+  }
+}
 
 export function loadHistory(): HistoryEntry[] {
   try {
@@ -292,6 +367,179 @@ export async function submitReview(
 // ---------------------------------------------------------------------------
 // Log stream
 // ---------------------------------------------------------------------------
+
+export interface ProductInfo {
+  image: string | null;
+  url: string | null;
+  name: string;
+  price: string | null;
+  price_currency: string | null;
+  brand: string | null;
+  rating: number | null;
+  review_count: number | null;
+  store: string;
+}
+
+export interface AvailabilityResult {
+  item_name: string;
+  found: boolean;
+  store: string;
+  product_count: number;
+  top_match: string | null;
+  error: string | null;
+  products?: ProductInfo[];
+}
+
+export async function checkEcommerceAvailability(
+  items: string[] | { name: string }[],
+): Promise<AvailabilityResult[]> {
+  const itemNames = items.map((it) =>
+    typeof it === "string" ? it : it.name,
+  );
+  const res = await fetch("/api/grocery/check-availability", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ items: itemNames }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: "Check failed" }));
+    const msg = err.error || `HTTP ${res.status}`;
+    throw new Error(`${msg} (${res.status})`);
+  }
+  const data = await res.json();
+  return data.results ?? [];
+}
+
+// ---------------------------------------------------------------------------
+// Prompta leads (marketing — find customers with grocery shopping needs)
+// ---------------------------------------------------------------------------
+
+export interface LeadsResult {
+  status: "success" | "error" | "payment_required";
+  content?: Array<{ text: string }>;
+  response?: string;
+  credits_used?: number;
+}
+
+export async function fetchLeads(): Promise<LeadsResult> {
+  const res = await fetch("/api/leads/get", { method: "POST" });
+  const data = await res.json();
+  if (!res.ok) {
+    return {
+      status: "error",
+      content: [{ text: data.error || `HTTP ${res.status}` }],
+      credits_used: 0,
+    };
+  }
+  return data as LeadsResult;
+}
+
+// ---------------------------------------------------------------------------
+// Shop Mate Seller Reviews (purchase review data)
+// ---------------------------------------------------------------------------
+
+export interface ReviewsResult {
+  status: "success" | "error" | "payment_required";
+  content?: Array<{ text: string }>;
+  response?: string;
+  credits_used?: number;
+}
+
+export async function fetchReviews(query?: string): Promise<ReviewsResult> {
+  const res = await fetch("/api/reviews/purchase", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: query ?? "" }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    return {
+      status: "error",
+      content: [{ text: data.error || `HTTP ${res.status}` }],
+      credits_used: 0,
+    };
+  }
+  return data as ReviewsResult;
+}
+
+// ---------------------------------------------------------------------------
+// Trust Net (rank/verify sellers)
+// ---------------------------------------------------------------------------
+
+export interface TrustNetAgent {
+  id?: string;
+  name?: string;
+  trust_score?: number;
+  star_rating?: number;
+  reviews?: number;
+  price?: string;
+  verified?: boolean;
+  [key: string]: unknown;
+}
+
+export async function fetchTrustNetAgents(): Promise<{
+  agents?: TrustNetAgent[];
+  items?: TrustNetAgent[];
+  raw?: string;
+  error?: string;
+}> {
+  const res = await fetch("/api/trustnet/agents");
+  const data = await res.json();
+  if (!res.ok) return { error: data.error || `HTTP ${res.status}` };
+  // Backend may return agents or items; normalize to agents
+  const out = data as { agents?: TrustNetAgent[]; items?: TrustNetAgent[]; raw?: string; error?: string };
+  if (out.agents) return out;
+  if (Array.isArray(out.items)) {
+    return { ...out, agents: out.items };
+  }
+  return out;
+}
+
+export async function fetchTrustNetReviews(agentId: string): Promise<{
+  reviews?: unknown[];
+  error?: string;
+}> {
+  const res = await fetch(`/api/trustnet/reviews?agent_id=${encodeURIComponent(agentId)}`);
+  const data = await res.json();
+  if (!res.ok) return { error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+export async function submitTrustNetReview(params: {
+  agent_id: string;
+  reviewer_address: string;
+  verification_tx: string;
+  score: number;
+  comment: string;
+}): Promise<{ error?: string }> {
+  const res = await fetch("/api/trustnet/review", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(params),
+  });
+  const data = await res.json();
+  if (!res.ok) return { error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+// ---------------------------------------------------------------------------
+// Platon (persistent context)
+// ---------------------------------------------------------------------------
+
+export interface ContextSave {
+  timestamp: string;
+  session_id: string;
+  task: string;
+  outcome: string;
+}
+
+export async function fetchContextSaves(): Promise<ContextSave[]> {
+  const res = await fetch("/api/platon/context-saves");
+  if (!res.ok) return [];
+  const data = await res.json();
+  const saves = data?.saves ?? [];
+  return Array.isArray(saves) ? saves : [];
+}
 
 export function connectLogStream(
   onLog: (entry: LogEntry) => void,

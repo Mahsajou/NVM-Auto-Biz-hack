@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { Shield, Users, Star } from "lucide-react";
 import {
   fetchSellers,
   fetchBalance,
@@ -8,6 +9,7 @@ import {
   loadHistory,
   saveHistory,
   submitReview,
+  loadBudget,
   type Seller,
   type LogEntry,
   type ChatMessage,
@@ -23,6 +25,12 @@ import ShoppingProgress, {
   type ShoppingItem,
 } from "./components/ShoppingProgress";
 import ShoppingHistory from "./components/ShoppingHistory";
+import AccountPage from "./components/AccountPage";
+import CheckAmazonCarryIt from "./components/CheckAmazonCarryIt";
+import TrustedSellers from "./components/TrustedSellers";
+import ContextTool from "./components/ContextTool";
+import GetLeads from "./components/GetLeads";
+import BuyReviews from "./components/BuyReviews";
 
 const MAX_LOGS = 200;
 
@@ -33,7 +41,12 @@ export default function App() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamingText, setStreamingText] = useState("");
   const [currentTool, setCurrentTool] = useState("");
-  const [_balance, setBalance] = useState<Record<string, unknown> | null>(null);
+  const [balanceData, setBalanceData] = useState<{
+    credits?: number;
+    trustnetCredits?: number;
+    spent?: number;
+    budget?: Record<string, unknown>;
+  } | null>(null);
 
   // Grocery state
   const [currentShoppingList, setCurrentShoppingList] = useState<GroceryItem[]>([]);
@@ -58,7 +71,9 @@ export default function App() {
     loadHistory(),
   );
   const [lastCompletedEntryId, setLastCompletedEntryId] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<"shopping" | "history">("shopping");
+  const [contextSavedAt, setContextSavedAt] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<"shopping" | "history" | "account" | "trusted" | "activity" | "context" | "leads" | "reviews">("trusted");
+  const [userBudget, setUserBudget] = useState<number>(() => loadBudget());
 
   useEffect(() => {
     const load = () => {
@@ -70,9 +85,24 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    fetchBalance().then((data) => {
-      if (data) setBalance(data);
-    });
+    const load = () => {
+      fetchBalance().then((data) => {
+        if (data) {
+          const credits = (data.balance as { balance?: number })?.balance;
+          const trustnetCredits = (data as { trustnet_balance?: number }).trustnet_balance;
+          const spent = (data.budget as { total_spent?: number })?.total_spent ?? 0;
+          setBalanceData({
+            credits: typeof credits === "number" ? credits : 0,
+            trustnetCredits: typeof trustnetCredits === "number" ? trustnetCredits : undefined,
+            spent,
+            budget: data.budget as Record<string, unknown>,
+          });
+        }
+      });
+    };
+    load();
+    const interval = setInterval(load, 10000);
+    return () => clearInterval(interval);
   }, []);
 
   useEffect(() => {
@@ -99,6 +129,16 @@ export default function App() {
     saveHistory(entries);
   }, []);
 
+  const handleEntryRatingChange = useCallback((entryId: string, rating: number | null) => {
+    setShoppingHistory((prev) => {
+      const next = prev.map((e) =>
+        e.id === entryId ? { ...e, rating } : e,
+      );
+      saveHistory(next);
+      return next;
+    });
+  }, []);
+
   // --- Chat handler ---
   const handleSend = useCallback(async (message: string) => {
     setMessages((prev) => [...prev, { role: "user", text: message }]);
@@ -123,7 +163,15 @@ export default function App() {
         setCurrentTool("");
         fetchSellers().then(setSellers).catch(() => {});
         fetchBalance().then((data) => {
-          if (data) setBalance(data);
+          if (data) {
+            const credits = (data.balance as { balance?: number })?.balance;
+            const spent = (data.budget as { total_spent?: number })?.total_spent ?? 0;
+            setBalanceData({
+              credits: typeof credits === "number" ? credits : 0,
+              spent,
+              budget: data.budget as Record<string, unknown>,
+            });
+          }
         });
       },
       onError: (error) => {
@@ -167,7 +215,15 @@ export default function App() {
         setIsShopping(false);
         setShoppingSummary(summary);
         fetchBalance().then((data) => {
-          if (data) setBalance(data);
+          if (data) {
+            const credits = (data.balance as { balance?: number })?.balance;
+            const spent = (data.budget as { total_spent?: number })?.total_spent ?? 0;
+            setBalanceData({
+              credits: typeof credits === "number" ? credits : 0,
+              spent,
+              budget: data.budget as Record<string, unknown>,
+            });
+          }
         });
 
         const itemsFromResults =
@@ -203,6 +259,10 @@ export default function App() {
       onError: (msg) => {
         setIsShopping(false);
         setParseError(msg);
+      },
+      onContextSaved: (save) => {
+        setContextSavedAt(save.timestamp);
+        setTimeout(() => setContextSavedAt(null), 8000);
       },
     });
   }, []);
@@ -241,19 +301,75 @@ export default function App() {
 
   const hasList = currentShoppingList.length > 0;
 
+  // Spent from API calls: grocery (shopping history) + budget session (chat, etc.)
+  const spentFromHistory = shoppingHistory.reduce((sum, e) => sum + e.summary.total_credits, 0);
+  const spentFromApi = balanceData?.spent ?? 0;
+  const spent = Math.max(spentFromHistory, spentFromApi);
+  const credits = balanceData?.credits ?? null;
+  const remaining = userBudget > 0 ? Math.max(0, userBudget - spent) : null;
+
   return (
     <div className="h-screen flex flex-col overflow-hidden">
-      {/* Top bar with New List button */}
-      <div className="flex items-center justify-between border-b px-4 py-2 shrink-0 bg-card">
-        <h1 className="text-lg font-semibold">Shop Mate</h1>
-        <button
-          type="button"
-          onClick={handleGroceryReset}
-          disabled={isShopping}
-          className="px-4 py-1.5 rounded-lg text-sm font-medium bg-gradient-to-r from-[var(--color-nvm-teal)] to-[var(--color-nvm-lime)] text-white shadow-sm hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-opacity"
-        >
-          + New List
-        </button>
+      {/* Top bar */}
+      <div className="flex items-center justify-between border-b px-4 py-2 shrink-0 bg-card gap-4">
+        <h1 className="text-lg font-semibold shrink-0">Shop Mate</h1>
+        <div className="flex-1 min-w-0" />
+        <div className="flex items-center gap-4 shrink-0">
+          <button
+            type="button"
+            onClick={() => setActiveTab("trusted")}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-muted/50 text-sm font-medium hover:bg-muted transition-colors"
+          >
+            <Shield className="h-4 w-4 text-[var(--color-nvm-teal)]" />
+            Trusted Sellers
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab("leads")}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-muted/50 text-sm font-medium hover:bg-muted transition-colors"
+          >
+            <Users className="h-4 w-4 text-[var(--color-nvm-teal)]" />
+            Get Lead
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab("reviews")}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-muted/50 text-sm font-medium hover:bg-muted transition-colors"
+          >
+            <Star className="h-4 w-4 text-[var(--color-nvm-teal)]" />
+            Buy Reviews
+          </button>
+          <div className="flex items-center gap-4 px-3 py-1.5 rounded-lg bg-muted/50 text-sm font-medium">
+            <span className="tabular-nums">
+              <span className="text-muted-foreground">Balance:</span>{" "}
+              {credits != null ? `${credits} cr ($${credits})` : "—"}
+            </span>
+            {balanceData?.trustnetCredits != null && (
+              <span className="tabular-nums">
+                <span className="text-muted-foreground">Trust Net:</span>{" "}
+                {balanceData.trustnetCredits} cr
+              </span>
+            )}
+            <span className="tabular-nums">
+              <span className="text-muted-foreground">Spent:</span>{" "}
+              {spent} cr
+            </span>
+            {userBudget > 0 && (
+              <span className="tabular-nums">
+                <span className="text-muted-foreground">Limit:</span>{" "}
+                ${remaining !== null ? remaining : userBudget} / ${userBudget}
+              </span>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={handleGroceryReset}
+            disabled={isShopping}
+            className="px-4 py-1.5 rounded-lg text-sm font-medium bg-gradient-to-r from-[var(--color-nvm-teal)] to-[var(--color-nvm-lime)] text-white shadow-sm hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-opacity"
+          >
+            + New List
+          </button>
+        </div>
       </div>
 
       {/* Main content: Sellers | Grocery area */}
@@ -266,11 +382,11 @@ export default function App() {
         {/* Main panel: Tab bar + content */}
         <div className="flex-1 min-w-0 flex flex-col overflow-hidden">
           {/* Tab bar */}
-          <div className="flex shrink-0 border-b bg-muted/30">
+          <div className="flex shrink-0 border-b bg-muted/30 overflow-x-auto min-w-0">
             <button
               type="button"
               onClick={() => setActiveTab("shopping")}
-              className={`px-4 py-2.5 text-sm font-medium transition-colors ${
+              className={`shrink-0 px-4 py-2.5 text-sm font-medium transition-colors ${
                 activeTab === "shopping"
                   ? "border-b-2 border-[var(--color-nvm-teal)] text-foreground bg-background"
                   : "text-muted-foreground hover:text-foreground"
@@ -280,14 +396,80 @@ export default function App() {
             </button>
             <button
               type="button"
+              onClick={() => setActiveTab("trusted")}
+              className={`shrink-0 px-4 py-2.5 text-sm font-medium transition-colors ${
+                activeTab === "trusted"
+                  ? "border-b-2 border-[var(--color-nvm-teal)] text-foreground bg-background"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              Trusted Sellers
+            </button>
+            <button
+              type="button"
               onClick={() => setActiveTab("history")}
-              className={`px-4 py-2.5 text-sm font-medium transition-colors ${
+              className={`shrink-0 px-4 py-2.5 text-sm font-medium transition-colors ${
                 activeTab === "history"
                   ? "border-b-2 border-[var(--color-nvm-teal)] text-foreground bg-background"
                   : "text-muted-foreground hover:text-foreground"
               }`}
             >
               History
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab("account")}
+              className={`shrink-0 px-4 py-2.5 text-sm font-medium transition-colors ${
+                activeTab === "account"
+                  ? "border-b-2 border-[var(--color-nvm-teal)] text-foreground bg-background"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              Account
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab("activity")}
+              className={`shrink-0 px-4 py-2.5 text-sm font-medium transition-colors ${
+                activeTab === "activity"
+                  ? "border-b-2 border-[var(--color-nvm-teal)] text-foreground bg-background"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              Activity Log
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab("context")}
+              className={`shrink-0 px-4 py-2.5 text-sm font-medium transition-colors ${
+                activeTab === "context"
+                  ? "border-b-2 border-[var(--color-nvm-teal)] text-foreground bg-background"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              Context Tool
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab("leads")}
+              className={`shrink-0 px-4 py-2.5 text-sm font-medium transition-colors ${
+                activeTab === "leads"
+                  ? "border-b-2 border-[var(--color-nvm-teal)] text-foreground bg-background"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              Leads
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab("reviews")}
+              className={`shrink-0 px-4 py-2.5 text-sm font-medium transition-colors ${
+                activeTab === "reviews"
+                  ? "border-b-2 border-[var(--color-nvm-teal)] text-foreground bg-background"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              Buy Reviews
             </button>
           </div>
 
@@ -317,6 +499,10 @@ export default function App() {
                     {parseError}
                   </div>
                 )}
+                <CheckAmazonCarryIt
+                  shoppingListItems={currentShoppingList}
+                  disabled={isShopping}
+                />
               </div>
             )}
             {activeTab === "history" && (
@@ -324,17 +510,53 @@ export default function App() {
                 <ShoppingHistory
                   entries={shoppingHistory}
                   onEntriesChange={handleHistoryChange}
+                  onRatingChange={handleEntryRatingChange}
                   fullHeight
                 />
               </div>
             )}
-          </div>
-
-          <div className="h-[180px] shrink-0 border-t">
-            <ActivityLog logs={logs} />
+            {activeTab === "account" && (
+              <div className="flex-1 overflow-auto p-6">
+                <AccountPage
+                  onBudgetChange={setUserBudget}
+                />
+              </div>
+            )}
+            {activeTab === "trusted" && (
+              <div className="flex-1 min-h-0 overflow-auto p-6 bg-background">
+                <TrustedSellers />
+              </div>
+            )}
+            {activeTab === "activity" && (
+              <div className="flex-1 min-h-0 overflow-hidden flex flex-col p-4">
+                <ActivityLog logs={logs} />
+              </div>
+            )}
+            {activeTab === "context" && (
+              <div className="flex-1 min-h-0 overflow-auto">
+                <ContextTool lastSavedAt={contextSavedAt} />
+              </div>
+            )}
+            {activeTab === "leads" && (
+              <div className="flex-1 overflow-auto p-6">
+                <GetLeads />
+              </div>
+            )}
+            {activeTab === "reviews" && (
+              <div className="flex-1 overflow-auto p-6">
+                <BuyReviews />
+              </div>
+            )}
           </div>
         </div>
       </div>
+
+      {/* Context saved toast - shows when Platon dump succeeds */}
+      {contextSavedAt && (
+        <div className="fixed bottom-24 right-6 z-50 rounded-lg border border-green-200 bg-green-50 dark:border-green-800 dark:bg-green-950/90 px-4 py-2 text-sm text-green-800 dark:text-green-200 shadow-lg">
+          Context saved at {new Date(contextSavedAt).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}
+        </div>
+      )}
 
       {/* Chat FAB - floating bottom-right */}
       <ChatFab

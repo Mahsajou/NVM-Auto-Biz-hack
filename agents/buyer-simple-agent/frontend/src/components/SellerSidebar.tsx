@@ -28,22 +28,26 @@ export default function SellerSidebar({ sellers }: SellerSidebarProps) {
               <span className="text-sm">Waiting for sellers...</span>
             </div>
           )}
-          {sellers.map((seller) => (
+          {sellers.map((seller) => {
+            const name = typeof seller.name === "string" ? seller.name : (Array.isArray(seller.name) ? (seller.name as string[]).join(", ") : String(seller.name ?? "Unknown"));
+            const skills = Array.isArray(seller.skills) ? seller.skills : [];
+            const skillLabels = skills.map((s) => typeof s === "string" ? s : (s && typeof s === "object" && "name" in s ? String((s as { name?: string }).name) : String(s)));
+            return (
             <Card key={seller.url} className="shadow-none">
               <CardHeader className="p-3 pb-1">
-                <CardTitle className="text-sm">{seller.name}</CardTitle>
-                {seller.description && (
+                <CardTitle className="text-sm">{name}</CardTitle>
+                {seller.description && typeof seller.description === "string" && (
                   <p className="text-xs text-muted-foreground leading-snug line-clamp-2">
                     {seller.description}
                   </p>
                 )}
               </CardHeader>
               <CardContent className="p-3 pt-2 space-y-2">
-                {seller.skills.length > 0 && (
+                {skillLabels.length > 0 && (
                   <div className="flex flex-wrap gap-1">
-                    {seller.skills.map((skill) => (
+                    {skillLabels.map((skill, i) => (
                       <Badge
-                        key={skill}
+                        key={`${skill}-${i}`}
                         variant="secondary"
                         className="text-[10px] bg-primary/10 text-primary border-0 font-medium"
                       >
@@ -59,7 +63,8 @@ export default function SellerSidebar({ sellers }: SellerSidebarProps) {
                 </div>
               </CardContent>
             </Card>
-          ))}
+          );
+          })}
         </div>
       </ScrollArea>
     </div>

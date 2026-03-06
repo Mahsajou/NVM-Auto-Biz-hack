@@ -103,9 +103,15 @@ class SellerRegistry:
             sellers = list(self._sellers.values())
         result = []
         for s in sellers:
-            skill_names = [
-                sk.get("name", sk.get("id", "unknown")) for sk in s.skills
-            ]
+            skill_names = []
+            for sk in s.skills or []:
+                if isinstance(sk, str):
+                    skill_names.append(sk)
+                elif isinstance(sk, dict):
+                    name = sk.get("name") or sk.get("id") or "unknown"
+                    skill_names.append(str(name) if not isinstance(name, list) else ", ".join(str(x) for x in name))
+                else:
+                    skill_names.append(str(sk))
             result.append({
                 "url": s.url,
                 "name": s.name,

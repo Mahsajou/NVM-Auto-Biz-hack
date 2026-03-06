@@ -13,8 +13,16 @@ export default defineConfig({
   server: {
     proxy: {
       "/api": {
-        target: "http://localhost:8000",
+        target: "http://127.0.0.1:8000",
         changeOrigin: true,
+        secure: false,
+        configure: (proxy) => {
+          proxy.on("proxyReq", (proxyReq, req) => {
+            if (process.env.DEBUG_PROXY) {
+              console.log("[proxy]", req.method, req.url, "->", proxyReq.path);
+            }
+          });
+        },
       },
     },
   },
