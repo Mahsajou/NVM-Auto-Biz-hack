@@ -17,6 +17,7 @@ import asyncio
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -35,13 +36,17 @@ from strands.models.openai import OpenAIModel
 from .log import enable_web_logging, get_logger, log
 from .registration_server import RegistrationExecutor, _build_buyer_agent_card
 from .strands_agent import (
+    NVM_AGENT_ID,
     NVM_PLAN_ID,
+    SELLER_URL,
     budget,
     create_agent,
     payments,
     seller_registry,
 )
 from .tools.balance import check_balance_impl
+from .grocery_parser import parse_grocery_list, GroceryItem
+from .tools.purchase import purchase_data_impl
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 BUYER_PORT = int(os.getenv("BUYER_PORT", "8000"))
@@ -210,6 +215,204 @@ async def log_stream(request: Request):
             _log_subscribers.discard(sub_queue)
 
     return EventSourceResponse(event_generator())
+
+
+# ---------------------------------------------------------------------------
+# Grocery shopping endpoints (no LLM — direct x402 purchase flow)
+# ---------------------------------------------------------------------------
+
+_grocery_session: dict = {"active": False, "items": [], "results": []}
+_grocery_reviews: list[dict] = []
+
+
+def _get_seller_name_and_url() -> tuple[str, str]:
+    """Get seller name and URL from registry or fallback to SELLER_URL."""
+    sellers = seller_registry.list_all()
+    base = SELLER_URL.rstrip("/")
+    for s in sellers:
+        if s["url"].rstrip("/") == base:
+            return s["name"], s["url"]
+    return "Grocery Seller", SELLER_URL
+
+
+@app.post("/api/grocery/parse")
+async def grocery_parse(request: Request):
+    """Parse a grocery list from text or file upload.
+
+    Accepts JSON body {"text": "..."} or multipart file upload.
+    Returns parsed items ready for shopping.
+    """
+    content_type = request.headers.get("content-type", "")
+
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        upload = form.get("file")
+        if not upload:
+            return JSONResponse({"error": "No file uploaded"}, status_code=400)
+        raw = (await upload.read()).decode("utf-8", errors="replace")
+    else:
+        body = await request.json()
+        raw = body.get("text", "")
+
+    if not raw.strip():
+        return JSONResponse({"error": "Empty grocery list"}, status_code=400)
+
+    items = parse_grocery_list(raw)
+    if not items:
+        return JSONResponse({"error": "No items found in the list"}, status_code=400)
+
+    log(_logger, "GROCERY", "PARSED", f"{len(items)} items from upload")
+    return JSONResponse({
+        "items": [item.to_dict() for item in items],
+        "count": len(items),
+    })
+
+
+@app.post("/api/grocery/shop")
+async def grocery_shop(request: Request):
+    """Shop a grocery list item-by-item via x402. Streams progress via SSE.
+
+    Accepts {"items": [...]} where each item has name, quantity, unit.
+    No LLM needed — calls purchase_data_impl() directly.
+    """
+    body = await request.json()
+    raw_items = body.get("items", [])
+    if not raw_items:
+        return JSONResponse({"error": "No items to shop"}, status_code=400)
+
+    items = [
+        GroceryItem(
+            name=it["name"],
+            quantity=float(it.get("quantity", 1)),
+            unit=it.get("unit", "each"),
+            raw_line=it.get("raw_line", it["name"]),
+        )
+        for it in raw_items
+    ]
+
+    log(_logger, "GROCERY", "SHOP", f"starting shop for {len(items)} items")
+    _grocery_session.update(active=True, items=raw_items, results=[])
+
+    async def event_generator():
+        total_credits = 0
+        purchased, skipped, failed = 0, 0, 0
+
+        for idx, item in enumerate(items):
+            yield {
+                "event": "item_start",
+                "data": json.dumps({
+                    "index": idx,
+                    "total": len(items),
+                    "item": item.to_dict(),
+                }),
+            }
+
+            allowed, reason = budget.can_spend(1)
+            if not allowed:
+                skipped += 1
+                entry = {"item": item.to_dict(), "status": "skipped", "reason": reason}
+                _grocery_session["results"].append(entry)
+                yield {
+                    "event": "item_done",
+                    "data": json.dumps({"index": idx, **entry}),
+                }
+                continue
+
+            result = await asyncio.to_thread(
+                purchase_data_impl,
+                payments=payments,
+                plan_id=NVM_PLAN_ID,
+                seller_url=SELLER_URL,
+                query=item.to_query(),
+                agent_id=NVM_AGENT_ID,
+            )
+
+            if result.get("status") == "success":
+                credits = result.get("credits_used", 1)
+                budget.record_purchase(credits, SELLER_URL, item.to_query())
+                total_credits += credits
+                purchased += 1
+                entry = {
+                    "item": item.to_dict(),
+                    "status": "purchased",
+                    "credits": credits,
+                    "response": result.get("response", "")[:200],
+                }
+            else:
+                failed += 1
+                error_text = ""
+                if result.get("content"):
+                    error_text = result["content"][0]["text"][:200]
+                entry = {
+                    "item": item.to_dict(),
+                    "status": "failed",
+                    "error": error_text,
+                }
+
+            _grocery_session["results"].append(entry)
+            yield {
+                "event": "item_done",
+                "data": json.dumps({"index": idx, **entry}),
+            }
+
+        _grocery_session["active"] = False
+        seller_name, seller_url = _get_seller_name_and_url()
+        yield {
+            "event": "shopping_done",
+            "data": json.dumps({
+                "purchased": purchased,
+                "skipped": skipped,
+                "failed": failed,
+                "total_credits": total_credits,
+                "budget": budget.get_status(),
+                "seller_name": seller_name,
+                "seller_url": seller_url,
+                "results": _grocery_session["results"],
+            }),
+        }
+
+    return EventSourceResponse(event_generator())
+
+
+@app.get("/api/grocery/status")
+async def grocery_status():
+    """Return the current grocery shopping session state."""
+    return JSONResponse({
+        "active": _grocery_session["active"],
+        "items_total": len(_grocery_session["items"]),
+        "items_processed": len(_grocery_session["results"]),
+        "results": _grocery_session["results"],
+    })
+
+
+@app.post("/api/grocery/review")
+async def grocery_review(request: Request):
+    """Submit a rating and review for a seller."""
+    body = await request.json()
+    seller_url = body.get("seller_url", "")
+    seller_name = body.get("seller_name", "Grocery Seller")
+    rating = body.get("rating", 0)
+    review = body.get("review", "")
+
+    if not seller_url or not (1 <= rating <= 5):
+        return JSONResponse({"error": "seller_url and rating (1-5) required"}, status_code=400)
+
+    entry = {
+        "seller_url": seller_url,
+        "seller_name": seller_name,
+        "rating": rating,
+        "review": review,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    _grocery_reviews.append(entry)
+    log(_logger, "GROCERY", "REVIEW", f"seller={seller_name} rating={rating}")
+    return JSONResponse({"status": "ok", "review": entry})
+
+
+@app.get("/api/grocery/reviews")
+async def grocery_reviews():
+    """Return all submitted reviews."""
+    return JSONResponse({"reviews": _grocery_reviews})
 
 
 # ---------------------------------------------------------------------------
